@@ -1,0 +1,17 @@
+apiVersion: v2
+name: superset-aks-databricks
+version: 0.1.0
+appVersion: "3.1.0"
+description: A Helm chart for deploying Apache Superset on Azure Kubernetes Service with Azure Databricks integration.
+type: application
+keywords:
+  - superset
+  - aks
+  - databricks
+  - helm
+  - kubernetes
+maintainers:
+  - name: Superset AKS Team
+    email: admin@example.com
+sources:
+  - https://example.com/superset-aks-databricks

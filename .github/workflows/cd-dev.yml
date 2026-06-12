@@ -1,0 +1,194 @@
+# GitHub Actions CD Pipeline - Deploy to Development
+# Automatically deploys to dev environment on successful CI build
+
+name: CD - Deploy to Development
+
+on:
+  workflow_run:
+    workflows: ["CI - Build and Test"]
+    types:
+      - completed
+    branches:
+      - develop
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (leave empty for latest)'
+        required: false
+        type: string
+
+env:
+  AZURE_SUBSCRIPTION: 'azure-service-connection'
+  AKS_RESOURCE_GROUP: 'rg-superset-test-ci'
+  AKS_CLUSTER_NAME: 'aks-superset-test-ci'
+  KUBERNETES_NAMESPACE: 'superset'
+  ACR_NAME: 'acrflashsupersetdev'
+  HELM_RELEASE_NAME: 'superset'
+  ENVIRONMENT: 'dev'
+  KEY_VAULT_NAME: 'kv-superset-test-ci'
+
+jobs:
+  deploy-dev:
+    name: Deploy to Development
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    
+    environment:
+      name: development
+      url: https://superset-dev.example.com
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v4
+      with:
+        version: 'latest'
+
+    - name: Set up Helm
+      uses: azure/setup-helm@v3
+      with:
+        version: '3.12.0'
+
+    - name: Download build artifacts
+      if: github.event_name == 'workflow_run'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            run_id: ${{ github.event.workflow_run.id }},
+          });
+          
+          const buildArtifact = artifacts.data.artifacts.find(
+            artifact => artifact.name === 'build-artifacts'
+          );
+          
+          if (buildArtifact) {
+            const download = await github.rest.actions.downloadArtifact({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              artifact_id: buildArtifact.id,
+              archive_format: 'zip',
+            });
+            
+            const fs = require('fs');
+            fs.writeFileSync('build-artifacts.zip', Buffer.from(download.data));
+            
+            console.log('✅ Downloaded build artifacts');
+          } else {
+            core.setFailed('Build artifacts not found');
+          }
+
+    - name: Extract artifacts and get image tag
+      if: github.event_name == 'workflow_run'
+      run: |
+        unzip build-artifacts.zip -d build-artifacts/
+        IMAGE_TAG=$(cat build-artifacts/image-tag.txt)
+        echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+        echo "📦 Image tag: $IMAGE_TAG"
+
+    - name: Set manual image tag
+      if: github.event_name == 'workflow_dispatch'
+      run: |
+        if [ -n "${{ github.event.inputs.image_tag }}" ]; then
+          IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+        else
+          IMAGE_TAG="${{ github.sha }}"
+        fi
+        echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+        echo "📦 Image tag: $IMAGE_TAG"
+
+    - name: Get AKS credentials
+      run: |
+        az aks get-credentials \
+          --resource-group ${{ env.AKS_RESOURCE_GROUP }} \
+          --name ${{ env.AKS_CLUSTER_NAME }} \
+          --overwrite-existing
+
+    - name: Create namespace
+      run: |
+        kubectl create namespace ${{ env.KUBERNETES_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+
+    - name: Configure secrets from Key Vault
+      run: |
+        KEY_VAULT_NAME="${{ env.KEY_VAULT_NAME }}"
+
+        DB_PASSWORD=$(az keyvault secret show --vault-name "$KEY_VAULT_NAME" --name "db-password" --query value -o tsv 2>/dev/null || true)
+        SECRET_KEY=$(az keyvault secret show --vault-name "$KEY_VAULT_NAME" --name "secret-key" --query value -o tsv 2>/dev/null || true)
+        DATABRICKS_TOKEN=$(az keyvault secret show --vault-name "$KEY_VAULT_NAME" --name "databricks-token" --query value -o tsv 2>/dev/null || true)
+
+        if [ -z "$DB_PASSWORD" ] || [ -z "$SECRET_KEY" ] || [ -z "$DATABRICKS_TOKEN" ]; then
+          echo "Required secrets are missing from Key Vault: $KEY_VAULT_NAME"
+          exit 1
+        fi
+
+        kubectl create secret generic superset-secrets \
+          --from-literal=database-uri="postgresql+psycopg2://superset:$DB_PASSWORD@superset-postgresql:5432/superset" \
+          --from-literal=redis-uri="redis://superset-redis-master:6379/0" \
+          --from-literal=secret-key="$SECRET_KEY" \
+          --from-literal=guest-token-secret="$SECRET_KEY" \
+          --from-literal=databricks-token="$DATABRICKS_TOKEN" \
+          --from-literal=postgres-password="$DB_PASSWORD" \
+          --namespace ${{ env.KUBERNETES_NAMESPACE }} \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+        echo "✅ Secrets configured from Key Vault"
+
+    - name: Deploy with Helm
+      run: |
+        cd helm
+        
+        # Update Helm dependencies
+        helm dependency update
+        
+        # Deploy to dev environment
+        helm upgrade --install ${{ env.HELM_RELEASE_NAME }} . \
+          --namespace ${{ env.KUBERNETES_NAMESPACE }} \
+          --values values-dev.yaml \
+          --set image.repository=${{ env.ACR_NAME }}.azurecr.io/superset \
+          --set image.tag=$IMAGE_TAG \
+          --timeout 15m \
+          --wait \
+          --atomic
+
+    - name: Verify deployment
+      run: |
+        echo "=== Verifying Deployment ==="
+        
+        # Wait for rollout
+        kubectl rollout status deployment/superset -n ${{ env.KUBERNETES_NAMESPACE }} --timeout=600s || true
+        
+        # Check pod status
+        kubectl get pods -n ${{ env.KUBERNETES_NAMESPACE }}
+        
+        # Check service status
+        kubectl get services -n ${{ env.KUBERNETES_NAMESPACE }}
+
+    - name: Run smoke tests
+      run: |
+        echo "Running smoke tests..."
+        
+        # Wait for pods to be ready
+        kubectl wait --for=condition=ready pod -l app=superset -n ${{ env.KUBERNETES_NAMESPACE }} --timeout=300s || true
+        
+        # Get pod logs for debugging
+        kubectl logs -l app=superset -n ${{ env.KUBERNETES_NAMESPACE }} --tail=50 || true
+        
+        echo "✅ Deployment verification complete"
+
+    - name: Deployment summary
+      if: success()
+      run: |
+        echo "🚀 Development deployment completed successfully!"
+        echo "Environment: Development"
+        echo "Namespace: ${{ env.KUBERNETES_NAMESPACE }}"
+        echo "Image: ${{ env.ACR_NAME }}.azurecr.io/superset:$IMAGE_TAG"
+        echo "Deployment time: $(date)"

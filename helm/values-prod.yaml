@@ -1,0 +1,97 @@
+# Production Environment Helm Values
+# High availability configuration for production workloads
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: superset-config
+  namespace: superset
+data:
+  SUPERSET_DATABASE_URI: "postgresql+psycopg2://<username>:<password>@postgres:5432/superset"
+  REDIS_URL: "redis://redis:6379/0"
+  SECRET_KEY: "<your-secret-key>"
+  ENABLE_CORS: "false"  # Disabled for production security
+  CORS_OPTIONS: '{"origins": ["https://superset.example.com"], "supports_credentials": true}'
+  FEATURE_FLAGS: '{"ALERTS": true, "DASHBOARD_CROSS_FILTER": true}'
+
+image:
+  repository: acrflashsupersetprod.azurecr.io/superset
+  tag: "stable"  # Use stable tag for production
+  pullPolicy: IfNotPresent
+
+service:
+  enabled: true
+  type: ClusterIP  # Use Ingress for production
+  port: 8088
+
+resources:
+  limits:
+    cpu: "2000m"
+    memory: "4Gi"
+  requests:
+    cpu: "1000m"
+    memory: "2Gi"
+
+# High availability configuration
+replicaCount: 3
+
+# Pod Disruption Budget for HA
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+ingress:
+  enabled: true  # Ingress for production
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+  hosts:
+    - host: superset.example.com
+      paths:
+        - /
+  tls:
+    - secretName: superset-prod-tls
+      hosts:
+        - superset.example.com
+
+postgresql:
+  enabled: true
+  postgresqlUsername: superset
+  postgresqlPassword: <password>
+  postgresqlDatabase: superset
+  persistence:
+    enabled: true
+    size: 100Gi  # Larger storage for production
+  resources:
+    limits:
+      cpu: "2000m"
+      memory: "4Gi"
+    requests:
+      cpu: "1000m"
+      memory: "2Gi"
+
+redis:
+  enabled: true
+  master:
+    service:
+      enabled: true
+    persistence:
+      enabled: true
+      size: 20Gi
+  resources:
+    limits:
+      cpu: "1000m"
+      memory: "2Gi"
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+
+# Production monitoring
+monitoring:
+  enabled: true
+  
+# Backup configuration
+backup:
+  enabled: true
+  schedule: "0 2 * * *"  # Daily at 2 AM

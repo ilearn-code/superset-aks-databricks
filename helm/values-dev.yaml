@@ -1,0 +1,59 @@
+# Development Environment Helm Values
+# Used for development and testing environments
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: superset-config
+  namespace: superset
+data:
+  SUPERSET_DATABASE_URI: "postgresql+psycopg2://<username>:<password>@postgres:5432/superset"
+  REDIS_URL: "redis://redis:6379/0"
+  SECRET_KEY: "<your-secret-key>"
+  ENABLE_CORS: "true"
+  CORS_OPTIONS: '{"origins": ["*"], "supports_credentials": true}'
+  FEATURE_FLAGS: '{"ALERTS": true, "DASHBOARD_CROSS_FILTER": true}'
+
+image:
+  repository: acrflashsupersetdev.azurecr.io/superset
+  tag: "latest"
+  pullPolicy: Always  # Always pull latest for dev
+
+service:
+  enabled: true
+  type: LoadBalancer  # LoadBalancer for easy access in dev
+  port: 8088
+
+resources:
+  limits:
+    cpu: "1000m"
+    memory: "2Gi"
+  requests:
+    cpu: "500m"
+    memory: "1Gi"
+
+ingress:
+  enabled: false  # Using LoadBalancer instead
+  hosts:
+    - host: superset-dev.example.com
+      paths:
+        - /
+  tls: []
+
+postgresql:
+  enabled: true
+  postgresqlUsername: superset
+  postgresqlPassword: <password>
+  postgresqlDatabase: superset
+  persistence:
+    enabled: true
+    size: 20Gi
+
+redis:
+  enabled: true
+  master:
+    service:
+      enabled: true
+  persistence:
+    enabled: true
+    size: 8Gi

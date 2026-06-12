@@ -1,0 +1,268 @@
+# Azure DevOps CI Pipeline for Apache Superset
+# This pipeline builds, tests, and pushes Docker images to Azure Container Registry
+
+trigger:
+  branches:
+    include:
+    - main
+    - develop
+    - feature/*
+  paths:
+    exclude:
+    - README.md
+    - docs/*
+    - '*.md'
+
+pr:
+  branches:
+    include:
+    - main
+    - develop
+
+variables:
+  - group: superset-common  # Variable group in Azure DevOps Library
+  - name: dockerRegistryServiceConnection
+    value: 'acr-service-connection'
+  - name: imageRepository
+    value: 'superset'
+  - name: containerRegistry
+    value: '$(ACR_NAME).azurecr.io'
+  - name: dockerfilePath
+    value: 'docker/Dockerfile'
+  - name: tag
+    value: '$(Build.BuildId)'
+  - name: vmImageWindows
+    value: 'windows-latest'
+  - name: vmImageLinux
+    value: 'ubuntu-latest'
+  - name: pythonVersion
+    value: '3.9'
+
+stages:
+- stage: Validate
+  displayName: 'Validate and Lint'
+  jobs:
+  - job: Lint
+    displayName: 'Lint Code'
+    pool:
+      vmImage: $(vmImageWindows)
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+      displayName: 'Use Python $(pythonVersion)'
+
+    - script: |
+        python -m pip install --upgrade pip
+        pip install flake8 black mypy
+      displayName: 'Install linting tools'
+
+    - script: |
+        # Lint with flake8
+        flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 src/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+      displayName: 'Lint with flake8'
+      continueOnError: true
+
+    - script: |
+        # Check formatting with black
+        black --check src/
+      displayName: 'Check code formatting'
+      continueOnError: true
+
+    - script: |
+        # Type checking with mypy
+        mypy src/ --ignore-missing-imports
+      displayName: 'Type check with mypy'
+      continueOnError: true
+
+  - job: ValidateHelm
+    displayName: 'Validate Helm Charts'
+    pool:
+      vmImage: $(vmImageWindows)
+    steps:
+    - task: HelmInstaller@1
+      inputs:
+        helmVersionToInstall: '3.12.0'
+      displayName: 'Install Helm'
+
+    - powershell: |
+        cd helm
+        helm lint .
+        helm template . --values values.yaml --debug
+      displayName: 'Lint Helm Chart'
+
+- stage: Test
+  displayName: 'Run Tests'
+  dependsOn: Validate
+  condition: succeeded()
+  jobs:
+  - job: UnitTests
+    displayName: 'Unit Tests'
+    pool:
+      vmImage: $(vmImageWindows)
+    steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '$(pythonVersion)'
+      displayName: 'Use Python $(pythonVersion)'
+
+    - script: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov pytest-mock
+      displayName: 'Install dependencies'
+
+    - script: |
+        pytest tests/ --junitxml=junit/test-results.xml --cov=src --cov-report=xml --cov-report=html
+      displayName: 'Run tests with coverage'
+      continueOnError: true
+
+    - task: PublishTestResults@2
+      condition: succeededOrFailed()
+      inputs:
+        testResultsFiles: '**/test-*.xml'
+        testRunTitle: 'Publish test results'
+      displayName: 'Publish Test Results'
+
+    - task: PublishCodeCoverageResults@1
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(System.DefaultWorkingDirectory)/coverage.xml'
+      displayName: 'Publish Coverage Results'
+
+- stage: Build
+  displayName: 'Build Docker Image'
+  dependsOn: Test
+  condition: and(succeeded(), or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.SourceBranch'], 'refs/heads/develop'), startsWith(variables['Build.SourceBranch'], 'refs/heads/feature/')))
+  jobs:
+  - job: BuildImage
+    displayName: 'Build and Push Docker Image'
+    pool:
+      vmImage: $(vmImageLinux)
+    steps:
+    - task: Docker@2
+      displayName: 'Build Docker Image'
+      inputs:
+        command: build
+        repository: $(imageRepository)
+        dockerfile: $(dockerfilePath)
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(tag)
+          $(Build.SourceBranchName)-$(Build.BuildId)
+        arguments: |
+          --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          --build-arg VCS_REF=$(Build.SourceVersion)
+          --build-arg VERSION=$(Build.BuildId)
+
+    - task: Docker@2
+      displayName: 'Push Docker Image to ACR'
+      inputs:
+        command: push
+        repository: $(imageRepository)
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(tag)
+          $(Build.SourceBranchName)-$(Build.BuildId)
+
+    - task: Docker@2
+      displayName: 'Tag as Latest (Main Branch Only)'
+      condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+      inputs:
+        command: tag
+        arguments: '$(containerRegistry)/$(imageRepository):$(tag) $(containerRegistry)/$(imageRepository):latest'
+
+    - task: Docker@2
+      displayName: 'Push Latest Tag'
+      condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+      inputs:
+        command: push
+        repository: $(imageRepository)
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: latest
+
+- stage: SecurityScan
+  displayName: 'Security Scanning'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: ScanImage
+    displayName: 'Scan Docker Image for Vulnerabilities'
+    pool:
+      vmImage: $(vmImageLinux)
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Scan Image with Trivy'
+      inputs:
+        azureSubscription: 'azure-service-connection'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Install Trivy
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install trivy -y
+          
+          # Scan image
+          trivy image --severity HIGH,CRITICAL $(containerRegistry)/$(imageRepository):$(tag)
+
+    - task: AzureCLI@2
+      displayName: 'Scan with Microsoft Defender for Containers'
+      inputs:
+        azureSubscription: 'azure-service-connection'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az acr task create \
+            --name securityscan \
+            --registry $(ACR_NAME) \
+            --image $(imageRepository):$(tag) \
+            --cmd "mcr.microsoft.com/azure-defender/scan:latest" \
+            --platform linux/amd64
+      continueOnError: true
+
+- stage: PublishArtifacts
+  displayName: 'Publish Build Artifacts'
+  dependsOn: SecurityScan
+  condition: succeeded()
+  jobs:
+  - job: PublishArtifacts
+    displayName: 'Publish Helm Charts and Manifests'
+    pool:
+      vmImage: $(vmImageWindows)
+    steps:
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(System.DefaultWorkingDirectory)/helm'
+        artifact: 'helm-charts'
+        publishLocation: 'pipeline'
+      displayName: 'Publish Helm Charts'
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(System.DefaultWorkingDirectory)/kubernetes'
+        artifact: 'kubernetes-manifests'
+        publishLocation: 'pipeline'
+      displayName: 'Publish Kubernetes Manifests'
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(System.DefaultWorkingDirectory)/terraform'
+        artifact: 'terraform-modules'
+        publishLocation: 'pipeline'
+      displayName: 'Publish Terraform Modules'
+
+    - powershell: |
+        "$(tag)" | Out-File -FilePath "$(Build.ArtifactStagingDirectory)/image-tag.txt" -Encoding utf8
+        "$(Build.SourceVersion)" | Out-File -FilePath "$(Build.ArtifactStagingDirectory)/git-commit.txt" -Encoding utf8
+        "$(Build.BuildId)" | Out-File -FilePath "$(Build.ArtifactStagingDirectory)/build-id.txt" -Encoding utf8
+      displayName: 'Create Build Metadata'
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)'
+        artifact: 'build-metadata'
+        publishLocation: 'pipeline'
+      displayName: 'Publish Build Metadata'

@@ -1,0 +1,50 @@
+# Default values for superset-aks-databricks.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+replicaCount: 1
+
+image:
+  repository: acrflashsupersetdev.azurecr.io/superset
+  tag: latest
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  name: ""
+
+service:
+  type: LoadBalancer
+  port: 8088
+
+ingress:
+  enabled: false
+  pathType: Prefix
+  hosts:
+    - host: superset.local
+      paths:
+        - /
+  tls: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 1Gi
+
+imagePullSecrets: acr-secret
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}

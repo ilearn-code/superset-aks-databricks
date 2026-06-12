@@ -1,0 +1,568 @@
+# Azure DevOps CD Pipeline for Apache Superset
+# This pipeline handles Continuous Deployment to AKS environments
+# CI (build/test) is handled by GitHub Actions
+
+trigger: none # Manual trigger only - triggered by GitHub Actions CI completion
+
+pr: none # No PR triggers for CD pipeline
+
+parameters:
+- name: imageTag
+  displayName: 'Image Tag (from GitHub Actions)'
+  type: string
+  default: 'latest'
+- name: environment
+  displayName: 'Target Environment'
+  type: string
+  default: 'dev'
+  values:
+  - dev
+  - staging
+  - prod
+- name: gitCommit
+  displayName: 'Git Commit SHA'
+  type: string
+  default: ''
+
+variables:
+  - group: superset-common  # Variable group in Azure DevOps Library
+  - group: superset-${{ parameters.environment }}  # Environment-specific variables
+  - name: containerRegistry
+    value: 'acrflashsupersetdev.azurecr.io'
+  - name: imageRepository
+    value: 'superset'
+  - name: imageTag
+    value: ${{ parameters.imageTag }}
+  - name: targetEnvironment
+    value: ${{ parameters.environment }}
+  - name: vmImageLinux
+    value: 'ubuntu-latest'
+
+stages:
+- stage: ValidateDeployment
+  displayName: 'Validate Deployment Configuration'
+  jobs:
+  - job: ValidateConfig
+    displayName: 'Validate Configuration'
+    pool:
+      vmImage: $(vmImageLinux)
+    steps:
+    - checkout: self
+    
+    - task: AzureCLI@2
+      displayName: 'Validate Azure Resources'
+      inputs:
+        azureSubscription: 'azure-service-connection'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "Validating Azure resources for environment: $(targetEnvironment)"
+          
+          # Validate ACR access
+          az acr show --name acrflashsupersetdev --query "name" -o tsv
+          
+          # Validate AKS cluster
+          if [ "$(targetEnvironment)" = "dev" ]; then
+            AKS_NAME="aks-superset-test-ci"
+            RG_NAME="rg-superset-test-ci"
+          elif [ "$(targetEnvironment)" = "staging" ]; then
+            AKS_NAME="aks-superset-staging-ci"
+            RG_NAME="rg-superset-staging-ci"
+          else
+            AKS_NAME="aks-superset-prod-ci"
+            RG_NAME="rg-superset-prod-ci"
+          fi
+          
+          echo "Validating AKS cluster: $AKS_NAME in $RG_NAME"
+          az aks show --name $AKS_NAME --resource-group $RG_NAME --query "provisioningState" -o tsv
+          
+          # Validate Key Vault
+          az keyvault show --name kv-superset-test-ci --query "name" -o tsv
+
+    - task: AzureCLI@2
+      displayName: 'Verify Image Exists in ACR'
+      inputs:
+        azureSubscription: 'azure-service-connection'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "Verifying image exists: $(containerRegistry)/$(imageRepository):$(imageTag)"
+          
+          # Check if image exists
+          az acr repository show-tags \
+            --name acrflashsupersetdev \
+            --repository $(imageRepository) \
+            --query "[?contains(@, '$(imageTag)')]" \
+            --output table
+          
+          if [ $? -eq 0 ]; then
+            echo "✅ Image found in registry"
+          else
+            echo "❌ Image not found in registry"
+            exit 1
+          fi
+
+- stage: DeployToDev
+  displayName: 'Deploy to Development'
+  dependsOn: ValidateDeployment
+  condition: and(succeeded(), eq(variables.targetEnvironment, 'dev'))
+  jobs:
+  - deployment: DeploySuperset
+    displayName: 'Deploy Superset to Dev AKS'
+    pool:
+      vmImage: $(vmImageLinux)
+    environment: 'superset-dev'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          
+          - task: AzureCLI@2
+            displayName: 'Get AKS Credentials'
+            inputs:
+              azureSubscription: 'azure-service-connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az aks get-credentials \
+                  --resource-group rg-superset-test-ci \
+                  --name aks-superset-test-ci \
+                  --overwrite-existing
+
+          - task: KubernetesManifest@0
+            displayName: 'Create Namespace'
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: 'aks-superset-test-ci-connection'
+              namespace: 'superset-dev'
+              manifests: |
+                apiVersion: v1
+                kind: Namespace
+                metadata:
+                  name: superset-dev
+              
+          - task: AzureCLI@2
+            displayName: 'Deploy with Updated Image'
+            inputs:
+              azureSubscription: 'azure-service-connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Update image in deployment manifest
+                sed -i "s|image: acrflashsupersetdev.azurecr.io/superset:.*|image: $(containerRegistry)/$(imageRepository):$(imageTag)|g" k8s-deployment/deployment.yaml
+                
+                # Create secrets from Key Vault instead of applying a checked-in secret manifest
+                $KEY_VAULT_NAME = "kv-superset-test-ci"
+                $DB_PASSWORD = az keyvault secret show --vault-name $KEY_VAULT_NAME --name "db-password" --query value -o tsv 2>$null
+                $SECRET_KEY = az keyvault secret show --vault-name $KEY_VAULT_NAME --name "secret-key" --query value -o tsv 2>$null
+
+                if ([string]::IsNullOrWhiteSpace($DB_PASSWORD) -or [string]::IsNullOrWhiteSpace($SECRET_KEY)) {
+                  throw "Required secrets are missing from Key Vault: $KEY_VAULT_NAME"
+                }
+
+                kubectl create secret generic superset-secrets `
+                  --from-literal=database-uri="postgresql+psycopg2://superset:$DB_PASSWORD@superset-postgresql:5432/superset" `
+                  --from-literal=redis-uri="redis://superset-redis-master:6379/0" `
+                  --from-literal=secret-key="$SECRET_KEY" `
+                  --namespace superset-dev `
+                  --dry-run=client -o yaml | kubectl apply -f -
+                
+                # Apply deployment
+                kubectl apply -f k8s-deployment/deployment.yaml -n superset-dev
+                
+                # Apply service
+                kubectl apply -f k8s-deployment/service.yaml -n superset-dev
+
+          - task: AzureCLI@2
+            displayName: 'Wait for Deployment'
+            inputs:
+              azureSubscription: 'azure-service-connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Wait for rollout to complete
+                kubectl rollout status deployment/superset -n superset-dev --timeout=600s
+                
+                # Show deployment status
+                kubectl get pods,services -n superset-dev
+                
+                # Get service URL
+                kubectl get service superset-service -n superset-dev -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+
+          - task: AzureCLI@2
+            displayName: 'Initialize Superset Database'
+            inputs:
+              azureSubscription: 'azure-service-connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "🔧 Initializing Superset database..."
+                
+                # Wait for pod to be ready
+                kubectl wait --for=condition=ready pod -l app=superset -n superset-dev --timeout=300s
+                
+                # Initialize database
+                kubectl exec deployment/superset -n superset-dev -- superset db upgrade
+                
+                echo "✅ Database migration completed"
+
+          - task: AzureCLI@2
+            displayName: 'Create Admin User'
+            inputs:
+              azureSubscription: 'azure-service-connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "👤 Creating Superset admin user..."
+
+                ADMIN_USERNAME="$(supersetAdminUsername)"
+                ADMIN_FIRSTNAME="$(supersetAdminFirstname)"
+                ADMIN_LASTNAME="$(supersetAdminLastname)"
+                ADMIN_EMAIL="$(supersetAdminEmail)"
+                ADMIN_PASSWORD="$(supersetAdminPassword)"
+
+                if [ -z "$ADMIN_USERNAME" ] || [ -z "$ADMIN_FIRSTNAME" ] || [ -z "$ADMIN_LASTNAME" ] || [ -z "$ADMIN_EMAIL" ] || [ -z "$ADMIN_PASSWORD" ]; then
+                  echo "Required admin credentials are not configured"
+                  exit 1
+                fi
+                
+                # Create admin user for dev environment
+                kubectl exec deployment/superset -n superset-dev -- \
+                  superset fab create-admin \
+                  --username "$ADMIN_USERNAME" \
+                  --firstname "$ADMIN_FIRSTNAME" \
+                  --lastname "$ADMIN_LASTNAME" \
+                  --email "$ADMIN_EMAIL" \
+                  --password "$ADMIN_PASSWORD"
+                
+                echo "✅ Admin user created"
+
+          - task: AzureCLI@2
+            displayName: 'Initialize Superset Roles'
+            inputs:
+              azureSubscription: 'azure-service-connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "🔐 Initializing Superset roles and permissions..."
+                
+                # Initialize Superset roles and permissions
+                kubectl exec deployment/superset -n superset-dev -- superset init
+                
+                echo "✅ Superset initialization completed"
+
+          - task: AzureCLI@2
+            displayName: 'Health Check and Validation'
+            inputs:
+              azureSubscription: 'azure-service-connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "🏥 Running health checks..."
+                
+                # Get service IP
+                SERVICE_IP=$(kubectl get service superset-service -n superset-dev -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+                
+                if [ -z "$SERVICE_IP" ]; then
+                  echo "⚠️ LoadBalancer IP not assigned yet, using port-forward for health check"
+                  kubectl port-forward service/superset-service 8088:8088 -n superset-dev &
+                  PORT_FORWARD_PID=$!
+                  sleep 10
+                  HEALTH_URL="http://localhost:8088/health"
+                else
+                  echo "🌐 LoadBalancer IP: $SERVICE_IP"
+                  HEALTH_URL="http://$SERVICE_IP:8088/health"
+                fi
+                
+                # Health check with retries
+                MAX_RETRIES=10
+                RETRY_COUNT=0
+                
+                while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+                  echo "Health check attempt $((RETRY_COUNT + 1))/$MAX_RETRIES..."
+                  
+                  if curl -f --connect-timeout 30 --max-time 60 "$HEALTH_URL" > /dev/null 2>&1; then
+                    echo "✅ Health check passed"
+                    break
+                  else
+                    echo "❌ Health check failed, retrying in 30 seconds..."
+                    sleep 30
+                    RETRY_COUNT=$((RETRY_COUNT + 1))
+                  fi
+                done
+                
+                # Clean up port forward if used
+                if [ ! -z "$PORT_FORWARD_PID" ]; then
+                  kill $PORT_FORWARD_PID 2>/dev/null || true
+                fi
+                
+                if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+                  echo "❌ Health check failed after $MAX_RETRIES attempts"
+                  exit 1
+                fi
+                
+                echo "🎉 Deployment validation completed successfully!"
+                echo "🌐 Access URL: http://$SERVICE_IP:8088" || echo "🌐 Use port-forward: kubectl port-forward service/superset-service 8088:8088 -n superset-dev"
+
+- stage: DeployToStaging
+  displayName: 'Deploy to Staging'
+  dependsOn: ValidateDeployment
+  condition: and(succeeded(), eq(variables.targetEnvironment, 'staging'))
+  jobs:
+  - deployment: DeploySuperset
+    displayName: 'Deploy Superset to Staging AKS'
+    pool:
+      vmImage: $(vmImageLinux)
+    environment: 'superset-staging'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          
+          - task: HelmInstaller@1
+            inputs:
+              helmVersionToInstall: '3.12.0'
+            displayName: 'Install Helm'
+
+          - task: AzureCLI@2
+            displayName: 'Deploy with Helm'
+            inputs:
+              azureSubscription: 'azure-service-connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Get AKS credentials
+                az aks get-credentials \
+                  --resource-group rg-superset-staging-ci \
+                  --name aks-superset-staging-ci \
+                  --overwrite-existing
+                
+                # Create namespace
+                kubectl create namespace superset-staging --dry-run=client -o yaml | kubectl apply -f -
+                
+                # Deploy with Helm
+                helm upgrade --install superset ./helm \
+                  --namespace superset-staging \
+                  --values environments/staging/values.yaml \
+                  --set image.tag=$(imageTag) \
+                  --set image.repository=$(containerRegistry)/$(imageRepository) \
+                  --wait --timeout=10m
+
+          - task: AzureCLI@2
+            displayName: 'Initialize Superset (Staging)'
+            inputs:
+              azureSubscription: 'azure-service-connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "🔧 Initializing Superset for staging environment..."
+
+                $ADMIN_USERNAME = "$(supersetAdminUsername)"
+                $ADMIN_FIRSTNAME = "$(supersetAdminFirstname)"
+                $ADMIN_LASTNAME = "$(supersetAdminLastname)"
+                $ADMIN_EMAIL = "$(supersetAdminEmail)"
+                $ADMIN_PASSWORD = "$(supersetAdminPassword)"
+
+                if ([string]::IsNullOrWhiteSpace($ADMIN_USERNAME) -or [string]::IsNullOrWhiteSpace($ADMIN_FIRSTNAME) -or [string]::IsNullOrWhiteSpace($ADMIN_LASTNAME) -or [string]::IsNullOrWhiteSpace($ADMIN_EMAIL) -or [string]::IsNullOrWhiteSpace($ADMIN_PASSWORD)) {
+                  throw "Required admin credentials are not configured"
+                }
+                
+                # Wait for pod to be ready
+                kubectl wait --for=condition=ready pod -l app=superset -n superset-staging --timeout=300s
+                
+                # Initialize database
+                kubectl exec deployment/superset -n superset-staging -- superset db upgrade
+                
+                # Create admin user for staging
+                kubectl exec deployment/superset -n superset-staging -- \
+                  superset fab create-admin \
+                  --username $ADMIN_USERNAME \
+                  --firstname $ADMIN_FIRSTNAME \
+                  --lastname $ADMIN_LASTNAME \
+                  --email $ADMIN_EMAIL \
+                  --password $ADMIN_PASSWORD
+                
+                # Initialize roles and permissions
+                kubectl exec deployment/superset -n superset-staging -- superset init
+                
+                echo "✅ Staging Superset initialization completed"
+
+- stage: DeployToProduction
+  displayName: 'Deploy to Production'
+  dependsOn: ValidateDeployment
+  condition: and(succeeded(), eq(variables.targetEnvironment, 'prod'))
+  jobs:
+  - deployment: DeploySuperset
+    displayName: 'Deploy Superset to Production AKS'
+    pool:
+      vmImage: $(vmImageLinux)
+    environment: 'superset-production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          
+          - task: HelmInstaller@1
+            inputs:
+              helmVersionToInstall: '3.12.0'
+            displayName: 'Install Helm'
+
+          - task: AzureCLI@2
+            displayName: 'Deploy with Helm (Rolling Update)'
+            inputs:
+              azureSubscription: 'azure-service-connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Get AKS credentials
+                az aks get-credentials \
+                  --resource-group rg-superset-prod-ci \
+                  --name aks-superset-prod-ci \
+                  --overwrite-existing
+                
+                # Create namespace
+                kubectl create namespace superset-prod --dry-run=client -o yaml | kubectl apply -f -
+                
+                # Deploy with Helm (production configuration)
+                helm upgrade --install superset ./helm \
+                  --namespace superset-prod \
+                  --values environments/prod/values.yaml \
+                  --set image.tag=$(imageTag) \
+                  --set image.repository=$(containerRegistry)/$(imageRepository) \
+                  --wait --timeout=15m
+
+          - task: AzureCLI@2
+            displayName: 'Verify Production Deployment'
+            inputs:
+              azureSubscription: 'azure-service-connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Health check
+                kubectl get pods -n superset-prod
+                kubectl rollout status deployment/superset -n superset-prod
+                
+                # Get service endpoint
+                SERVICE_IP=$(kubectl get service superset-service -n superset-prod -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+                echo "Production Superset available at: http://$SERVICE_IP:8088"
+
+          - task: AzureCLI@2
+            displayName: 'Initialize Superset (Production)'
+            inputs:
+              azureSubscription: 'azure-service-connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "🔧 Initializing Superset for production environment..."
+
+                $ADMIN_USERNAME = "$(supersetAdminUsername)"
+                $ADMIN_FIRSTNAME = "$(supersetAdminFirstname)"
+                $ADMIN_LASTNAME = "$(supersetAdminLastname)"
+                $ADMIN_EMAIL = "$(supersetAdminEmail)"
+                $ADMIN_PASSWORD = "$(supersetAdminPassword)"
+
+                if ([string]::IsNullOrWhiteSpace($ADMIN_USERNAME) -or [string]::IsNullOrWhiteSpace($ADMIN_FIRSTNAME) -or [string]::IsNullOrWhiteSpace($ADMIN_LASTNAME) -or [string]::IsNullOrWhiteSpace($ADMIN_EMAIL) -or [string]::IsNullOrWhiteSpace($ADMIN_PASSWORD)) {
+                  throw "Required admin credentials are not configured"
+                }
+                
+                # Wait for pod to be ready
+                kubectl wait --for=condition=ready pod -l app=superset -n superset-prod --timeout=300s
+                
+                # Initialize database
+                kubectl exec deployment/superset -n superset-prod -- superset db upgrade
+                
+                # Create admin user for production (use strong password from Key Vault)
+                kubectl exec deployment/superset -n superset-prod -- \
+                  superset fab create-admin \
+                  --username $ADMIN_USERNAME \
+                  --firstname $ADMIN_FIRSTNAME \
+                  --lastname $ADMIN_LASTNAME \
+                  --email $ADMIN_EMAIL \
+                  --password $ADMIN_PASSWORD
+                
+                # Initialize roles and permissions
+                kubectl exec deployment/superset -n superset-prod -- superset init
+                
+                echo "✅ Production Superset initialization completed"
+                echo "⚠️  IMPORTANT: Change default password immediately after first login!"
+
+          - task: AzureCLI@2
+            displayName: 'Production Health Check'
+            inputs:
+              azureSubscription: 'azure-service-connection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "🏥 Running production health checks..."
+                
+                SERVICE_IP=$(kubectl get service superset-service -n superset-prod -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+                
+                if [ -z "$SERVICE_IP" ]; then
+                  echo "❌ Production LoadBalancer IP not assigned"
+                  exit 1
+                fi
+                
+                HEALTH_URL="http://$SERVICE_IP:8088/health"
+                echo "🌐 Production URL: $HEALTH_URL"
+                
+                # Health check with retries
+                MAX_RETRIES=15
+                RETRY_COUNT=0
+                
+                while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+                  echo "Production health check attempt $((RETRY_COUNT + 1))/$MAX_RETRIES..."
+                  
+                  if curl -f --connect-timeout 30 --max-time 60 "$HEALTH_URL" > /dev/null 2>&1; then
+                    echo "✅ Production health check passed"
+                    break
+                  else
+                    echo "❌ Production health check failed, retrying in 60 seconds..."
+                    sleep 60
+                    RETRY_COUNT=$((RETRY_COUNT + 1))
+                  fi
+                done
+                
+                if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+                  echo "❌ Production health check failed after $MAX_RETRIES attempts"
+                  exit 1
+                fi
+                
+                echo "🎉 Production deployment validation completed successfully!"
+                echo "🌐 Production Access URL: http://$SERVICE_IP:8088"
+                echo "⚠️  CRITICAL: Change password immediately after first login!"
+
+- stage: PostDeployment
+  displayName: 'Post-Deployment Tasks'
+  dependsOn: 
+  - DeployToDev
+  - DeployToStaging
+  - DeployToProduction
+  condition: succeededOrFailed()
+  jobs:
+  - job: NotifyAndCleanup
+    displayName: 'Notification and Cleanup'
+    pool:
+      vmImage: $(vmImageLinux)
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Deployment Summary'
+      inputs:
+        azureSubscription: 'azure-service-connection'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "🚀 Deployment Summary"
+          echo "===================="
+          echo "Environment: $(targetEnvironment)"
+          echo "Image: $(containerRegistry)/$(imageRepository):$(imageTag)"
+          echo "Git Commit: ${{ parameters.gitCommit }}"
+          echo "Build Number: $(Build.BuildId)"
+          echo "Deployment Time: $(date)"
+          
+          # Add Slack notification here if needed
+          # curl -X POST -H 'Content-type: application/json' \
+          #   --data '{"text":"Superset deployed to $(targetEnvironment)"}' \
+          #   $SLACK_WEBHOOK_URL

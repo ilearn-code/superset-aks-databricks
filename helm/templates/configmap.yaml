@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: superset-config
+  namespace: superset
+data:
+  SUPERSET_DATABASE_URI: "postgresql+psycopg2://<username>:<password>@<host>:5432/superset"
+  REDIS_URL: "redis://redis:6379/0"
+  SECRET_KEY: "<set-via-secret>"
+  ENABLE_CORS: "true"
+  CORS_OPTIONS: '{"origins": ["*"], "supports_credentials": true}'
+  FEATURE_FLAGS: '{"ALERTS": true, "DASHBOARD_CROSS_FILTER": true}'

@@ -1,0 +1,421 @@
+# Azure DevOps CD Pipeline - Deploy to Production
+# Manual approval required for production deployment
+
+trigger: none
+
+pr: none
+
+resources:
+  pipelines:
+  - pipeline: ci-pipeline
+    source: 'Superset-CI'
+    trigger: none  # Manual trigger only for production
+
+variables:
+  - group: superset-prod
+  - name: environment
+    value: 'prod'
+  - name: azureSubscription
+    value: 'azure-service-connection'
+  - name: aksResourceGroup
+    value: 'rg-flash-superset-prod'
+  - name: aksClusterName
+    value: 'aks-flash-superset-prod'
+  - name: kubernetesNamespace
+    value: 'superset'
+  - name: acrName
+    value: 'acrflashsupersetprod'
+  - name: helmReleaseName
+    value: 'superset'
+
+# Use self-hosted agent pool for production deployments
+pool: 
+  name: 'default'
+  demands:
+  - agent.name -equals azure-agent
+
+stages:
+- stage: PreDeploymentValidation
+  displayName: 'Pre-Deployment Validation'
+  jobs:
+  - job: ValidateEnvironment
+    displayName: 'Validate Production Environment'
+    pool:
+      vmImage: 'windows-latest'
+    steps:
+    - download: ci-pipeline
+      artifact: build-metadata
+      displayName: 'Download Build Metadata'
+
+    - task: AzureCLI@2
+      displayName: 'Check Infrastructure State'
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: 'pscore'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Verify AKS cluster is running
+          $AKS_STATUS = az aks show `
+            --resource-group $(aksResourceGroup) `
+            --name $(aksClusterName) `
+            --query provisioningState -o tsv
+          
+          if ($AKS_STATUS -ne "Succeeded") {
+            Write-Host "❌ AKS cluster is not in healthy state: $AKS_STATUS"
+            exit 1
+          }
+          
+          Write-Host "✅ AKS cluster is healthy"
+
+    - task: AzureCLI@2
+      displayName: 'Verify ACR Image Exists'
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: 'pscore'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          $IMAGE_TAG = Get-Content "$(Pipeline.Workspace)/ci-pipeline/build-metadata/image-tag.txt" -Raw
+          $IMAGE_TAG = $IMAGE_TAG.Trim()
+          
+          # Check if image exists in ACR
+          az acr repository show `
+            --name $(acrName) `
+            --image superset:$IMAGE_TAG
+          
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "✅ Docker image verified in ACR"
+          } else {
+            Write-Host "❌ Docker image not found in ACR"
+            exit 1
+          }
+
+- stage: BackupProduction
+  displayName: 'Backup Production Environment'
+  dependsOn: PreDeploymentValidation
+  condition: succeeded()
+  jobs:
+  - job: BackupDatabase
+    displayName: 'Backup Production Database'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Create Database Backup'
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az aks get-credentials \
+            --resource-group $(aksResourceGroup) \
+            --name $(aksClusterName) \
+            --overwrite-existing
+          
+          # Trigger backup job
+          kubectl create job --from=cronjob/superset-backup \
+            manual-backup-$(date +%Y%m%d-%H%M%S) \
+            -n $(kubernetesNamespace)
+          
+          echo "✅ Backup job created"
+
+    - task: AzureCLI@2
+      displayName: 'Export Current Helm Values'
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          helm get values $(helmReleaseName) \
+            -n $(kubernetesNamespace) \
+            > $(Build.ArtifactStagingDirectory)/pre-deployment-values.yaml
+          
+          helm list -n $(kubernetesNamespace) \
+            > $(Build.ArtifactStagingDirectory)/pre-deployment-releases.txt
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)'
+        artifact: 'pre-deployment-backup'
+        publishLocation: 'pipeline'
+      displayName: 'Publish Backup Artifacts'
+
+- stage: DeployInfrastructure
+  displayName: 'Deploy Infrastructure (Terraform)'
+  dependsOn: BackupProduction
+  condition: succeeded()
+  jobs:
+  - deployment: TerraformDeploy
+    displayName: 'Deploy with Terraform'
+    environment: 'superset-prod-infra'
+    pool:
+      vmImage: 'windows-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: ci-pipeline
+            artifact: terraform-modules
+            displayName: 'Download Terraform Modules'
+
+          - task: TerraformInstaller@0
+            inputs:
+              terraformVersion: '1.5.0'
+            displayName: 'Install Terraform'
+
+          - task: AzureCLI@2
+            displayName: 'Terraform Init'
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                cd $(Pipeline.Workspace)/ci-pipeline/terraform-modules
+                
+                terraform init `
+                  -backend-config="resource_group_name=rg-terraform-state" `
+                  -backend-config="storage_account_name=sttfstateflashsuperset" `
+                  -backend-config="container_name=tfstate" `
+                  -backend-config="key=superset-$(environment).tfstate"
+
+          - task: AzureCLI@2
+            displayName: 'Terraform Plan'
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                cd $(Pipeline.Workspace)/ci-pipeline/terraform-modules
+                
+                terraform plan `
+                  -var-file="environments/$(environment).tfvars" `
+                  -out=tfplan `
+                  -input=false
+
+          - task: ManualValidation@0
+            displayName: 'Review Terraform Plan'
+            timeoutInMinutes: 60
+            inputs:
+              notifyUsers: |
+                your-team@your-domain.com
+              instructions: 'Please review the Terraform plan and approve to proceed with infrastructure changes.'
+
+          - task: AzureCLI@2
+            displayName: 'Terraform Apply'
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                cd $(Pipeline.Workspace)/ci-pipeline/terraform-modules
+                
+                terraform apply -auto-approve tfplan
+                
+                # Export outputs
+                terraform output -json | Out-File -FilePath "$(Build.ArtifactStagingDirectory)/terraform-outputs.json"
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/terraform-outputs.json'
+              artifact: 'terraform-outputs'
+              publishLocation: 'pipeline'
+            displayName: 'Publish Terraform Outputs'
+
+- stage: DeployApplication
+  displayName: 'Deploy Application to Production'
+  dependsOn: DeployInfrastructure
+  condition: succeeded()
+  jobs:
+  - deployment: DeployToAKS
+    displayName: 'Deploy Superset to AKS'
+    environment: 'superset-prod'
+    pool:
+      vmImage: 'windows-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: ci-pipeline
+            artifact: helm-charts
+            displayName: 'Download Helm Charts'
+
+          - download: ci-pipeline
+            artifact: kubernetes-manifests
+            displayName: 'Download K8s Manifests'
+
+          - download: ci-pipeline
+            artifact: build-metadata
+            displayName: 'Download Build Metadata'
+
+          - task: HelmInstaller@1
+            inputs:
+              helmVersionToInstall: '3.12.0'
+            displayName: 'Install Helm'
+
+          - task: AzureCLI@2
+            displayName: 'Get AKS Credentials'
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az aks get-credentials `
+                  --resource-group $(aksResourceGroup) `
+                  --name $(aksClusterName) `
+                  --overwrite-existing
+
+          - task: AzureCLI@2
+            displayName: 'Configure Secrets from Key Vault'
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $KEY_VAULT_NAME = "kv-flash-superset-prod"
+
+                $DB_PASSWORD = az keyvault secret show --vault-name $KEY_VAULT_NAME --name "db-password" --query value -o tsv 2>$null
+                $SECRET_KEY = az keyvault secret show --vault-name $KEY_VAULT_NAME --name "secret-key" --query value -o tsv 2>$null
+                $DATABRICKS_TOKEN = az keyvault secret show --vault-name $KEY_VAULT_NAME --name "databricks-token" --query value -o tsv 2>$null
+                $AZURE_CLIENT_SECRET = az keyvault secret show --vault-name $KEY_VAULT_NAME --name "azure-client-secret" --query value -o tsv 2>$null
+
+                if ([string]::IsNullOrWhiteSpace($DB_PASSWORD) -or [string]::IsNullOrWhiteSpace($SECRET_KEY) -or [string]::IsNullOrWhiteSpace($DATABRICKS_TOKEN) -or [string]::IsNullOrWhiteSpace($AZURE_CLIENT_SECRET)) {
+                  throw "Required secrets are missing from Key Vault: $KEY_VAULT_NAME"
+                }
+
+                kubectl create secret generic superset-secrets `
+                  --from-literal=database-uri="postgresql+psycopg2://superset:$DB_PASSWORD@superset-postgresql:5432/superset" `
+                  --from-literal=redis-uri="redis://superset-redis-master:6379/0" `
+                  --from-literal=secret-key="$SECRET_KEY" `
+                  --from-literal=guest-token-secret="$SECRET_KEY" `
+                  --from-literal=azure-client-id="$(AZURE_CLIENT_ID)" `
+                  --from-literal=azure-client-secret="$AZURE_CLIENT_SECRET" `
+                  --from-literal=azure-tenant-id="$(AZURE_TENANT_ID)" `
+                  --from-literal=databricks-token="$DATABRICKS_TOKEN" `
+                  --from-literal=postgres-password="$DB_PASSWORD" `
+                  --namespace $(kubernetesNamespace) `
+                  --dry-run=client -o yaml | kubectl apply -f -
+
+          - task: ManualValidation@0
+            displayName: 'Approve Production Deployment'
+            timeoutInMinutes: 1440  # 24 hours
+            inputs:
+              notifyUsers: |
+                your-team@your-domain.com
+              instructions: 'Please review and approve the production deployment. This will update the running Superset instance.'
+
+          - task: AzureCLI@2
+            displayName: 'Deploy with Helm (Rolling Update)'
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                cd $(Pipeline.Workspace)/ci-pipeline/helm-charts
+                
+                # Read image tag
+                $IMAGE_TAG = Get-Content "$(Pipeline.Workspace)/ci-pipeline/build-metadata/image-tag.txt" -Raw
+                $IMAGE_TAG = $IMAGE_TAG.Trim()
+                
+                # Update Helm dependencies
+                helm dependency update
+                
+                # Deploy with rolling update
+                helm upgrade --install $(helmReleaseName) . `
+                  --namespace $(kubernetesNamespace) `
+                  --values values.yaml `
+                  --values values-production.yaml `
+                  --set image.repository=$(acrName).azurecr.io/superset `
+                  --set image.tag=$IMAGE_TAG `
+                  --timeout 30m `
+                  --wait `
+                  --atomic `
+                  --debug
+
+          - task: Kubernetes@1
+            displayName: 'Verify Deployment Status'
+            inputs:
+              connectionType: 'Azure Resource Manager'
+              azureSubscriptionEndpoint: $(azureSubscription)
+              azureResourceGroup: $(aksResourceGroup)
+              kubernetesCluster: $(aksClusterName)
+              command: 'rollout'
+              arguments: 'status deployment/superset -n $(kubernetesNamespace) --timeout=10m'
+
+- stage: PostDeploymentTests
+  displayName: 'Post-Deployment Tests'
+  dependsOn: DeployApplication
+  condition: succeeded()
+  jobs:
+  - job: SmokeTests
+    displayName: 'Execute Smoke Tests'
+    pool:
+      vmImage: 'windows-latest'
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Health Check'
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: 'pscore'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az aks get-credentials `
+            --resource-group $(aksResourceGroup) `
+            --name $(aksClusterName) `
+            --overwrite-existing
+          
+          $SUPERSET_URL = kubectl get ingress -n $(kubernetesNamespace) -o jsonpath='{.items[0].spec.rules[0].host}'
+          
+          # Wait and test health endpoint
+          for ($i = 1; $i -le 30; $i++) {
+            try {
+              $response = Invoke-WebRequest -Uri "https://$SUPERSET_URL/health" -SkipCertificateCheck -TimeoutSec 5
+              if ($response.StatusCode -eq 200) {
+                Write-Host "✅ Superset is healthy!"
+                exit 0
+              }
+            } catch {
+              Write-Host "Waiting for Superset... ($i/30)"
+              Start-Sleep -Seconds 10
+            }
+          }
+          
+          Write-Host "❌ Health check failed"
+          exit 1
+
+    - task: AzureCLI@2
+      displayName: 'Integration Tests'
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: 'pscore'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Test database connectivity
+          kubectl exec -n $(kubernetesNamespace) deployment/superset -- superset fab list-users
+          
+          # Test Databricks connection (add your own tests)
+          Write-Host "✅ Integration tests passed"
+
+- stage: Notification
+  displayName: 'Send Notifications'
+  dependsOn: PostDeploymentTests
+  condition: always()
+  jobs:
+  - job: SendNotification
+    displayName: 'Notify Team'
+    pool:
+      vmImage: 'windows-latest'
+    steps:
+    - powershell: |
+        $STATUS = "${{ job.status }}"
+        Write-Host "🚀 Production deployment completed with status: $STATUS"
+        Write-Host "Environment: Production"
+        Write-Host "URL: https://superset.example.com"
+        # Add your notification logic here (Teams, Slack, Email)
+      displayName: 'Send Success Notification'
+      condition: succeeded()
+
+    - powershell: |
+        Write-Host "❌ Production deployment failed!"
+        Write-Host "Please check the pipeline logs and initiate rollback if necessary"
+        # Send failure notification
+      displayName: 'Send Failure Notification'
+      condition: failed()

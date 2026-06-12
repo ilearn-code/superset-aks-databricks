@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: superset
+  labels:
+    app: superset
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: superset
+  template:
+    metadata:
+      labels:
+        app: superset
+    spec:
+      initContainers:
+        - name: db-upgrade
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "Running database migrations..."
+              superset db upgrade
+              echo "Initializing Superset..."
+              superset init
+              echo "Database initialization complete!"
+          env:
+            - name: SUPERSET_DATABASE_URI
+              valueFrom:
+                secretKeyRef:
+                  name: superset-secrets
+                  key: database-uri
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: superset-secrets
+                  key: redis-url
+            - name: SUPERSET_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: superset-secrets
+                  key: secret-key
+      containers:
+        - name: superset
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports:
+            - containerPort: 8088
+          env:
+            - name: SUPERSET_DATABASE_URI
+              valueFrom:
+                secretKeyRef:
+                  name: superset-secrets
+                  key: database-uri
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: superset-secrets
+                  key: redis-url
+            - name: SUPERSET_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: superset-secrets
+                  key: secret-key
+          resources:
+            requests:
+              memory: {{ .Values.resources.requests.memory }}
+              cpu: {{ .Values.resources.requests.cpu }}
+            limits:
+              memory: {{ .Values.resources.limits.memory }}
+              cpu: {{ .Values.resources.limits.cpu }}
+      imagePullSecrets:
+        - name: {{ .Values.imagePullSecrets }}
